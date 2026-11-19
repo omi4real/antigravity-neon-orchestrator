@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import os
+import select
 import sys
 import urllib.error
 import urllib.request
@@ -73,7 +74,9 @@ def main():
     stdin_content = ""
     if not sys.stdin.isatty():
         try:
-            stdin_content = sys.stdin.read().strip()
+            r, _, _ = select.select([sys.stdin], [], [], 0.0)
+            if r:
+                stdin_content = sys.stdin.read().strip()
         except Exception:
             pass
 
