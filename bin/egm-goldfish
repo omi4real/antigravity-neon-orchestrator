@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+egm-goldfish: Stateless Goldfish Auditor via Gemini 4 Neon (Google EGM Plugin).
+
+Audits design specifications, implementation plans, and code diffs cold with ZERO
+accumulated context bias using Gemini 4 Neon's high-reasoning engine.
+
+Usage:
+    egm-goldfish docs/design_draft.md --persona design_critic
+    egm-goldfish plan.md --persona implementation_readiness
+    git diff | egm-goldfish --persona design_critic -
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+API_URL = os.environ.get("GEMINI_WEB_API_URL", "http://127.0.0.1:4981/openai/v1/chat/completions")
+
+PERSONA_MAP = {
+    "design": "design_critic.md",
+    "design_critic": "design_critic.md",
+    "readiness": "implementation_readiness.md",
+    "implementation_readiness": "implementation_readiness.md",
+    "structural": "structural.md",
+    "comprehension": "comprehension.md",
+    "codebase": "codebase_details.md",
+    "codebase_details": "codebase_details.md",
+    "zoom_out": "zoom_out.md",
+    "zoom-out": "zoom_out.md",
+    "style": "style.md",
+    "inventive": "inventive_catalyst.md",
+    "inventive_catalyst": "inventive_catalyst.md",
+    "synthesizer": "synthesizer.md",
+    "orchestrator": "bootstrap_orchestrator.md",
+}
+
+DEFAULT_STANDARDS = {
+    "design_critic.md": "feature-spec-standard.md",
+    "implementation_readiness.md": "implementation-readiness-standard.md",
+    "structural.md": "feature-spec-standard.md",
+    "zoom_out.md": "zoom-out-standard.md",
+}
+
+
+def find_search_directories():
+    """Discover agents and resources search directories in priority order."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    user_home = os.path.expanduser("~")
+
+    candidate_roots = [
+        repo_root,
+        os.path.join(user_home, ".antigravity-neon-orchestrator"),
+        os.path.join(user_home, ".gemini", "config", "plugins", "egm"),
+        os.getcwd(),
+    ]
+
+    agents_dirs = []
+    standards_dirs = []
+
+    for cr in candidate_roots:
+        a_dir = os.path.join(cr, "agents")
+        if os.path.isdir(a_dir) and a_dir not in agents_dirs:
+            agents_dirs.append(a_dir)
+
+        s_dir = os.path.join(cr, "resources", "document_standards")
+        if os.path.isdir(s_dir) and s_dir not in standards_dirs:
+            standards_dirs.append(s_dir)
+
+    return agents_dirs, standards_dirs
+
+
+def load_file_content(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        sys.stderr.write(f"Warning: Failed to read {path}: {e}\n")
+        return None
+
+
+def resolve_file(filename, search_dirs):
+    if os.path.exists(filename):
+        return filename
+    for s_dir in search_dirs:
+        candidate = os.path.join(s_dir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run an EGM Goldfish Review using Gemini 4 Neon")
+    parser.add_argument("target", nargs="?", default="", help="Target file path, or '-' for stdin / pipe")
+    parser.add_argument("-p", "--persona", default="design_critic",
+                        help=f"Reviewer persona (choices: {', '.join(PERSONA_MAP.keys())})")
+    parser.add_argument("-s", "--standard", default="",
+                        help="Document standard (e.g. feature-spec-standard, implementation-readiness-standard)")
+    parser.add_argument("-c", "--context", action="append", default=[], help="Supporting context file(s)")
+    parser.add_argument("-m", "--mode", choices=["REVIEW", "BRAINSTORM"], default="REVIEW",
+                        help="EGM Mode (default: REVIEW)")
+    parser.add_argument("--model", default="gemini-4-neon", help="Model to use (default: gemini-4-neon)")
+    parser.add_argument("--thinking", default="high", choices=["low", "medium", "high"], help="Thinking level")
+    parser.add_argument("--list-personas", action="store_true", help="List all available EGM personas")
+
+    args = parser.parse_args()
+
+    if args.list_personas:
+        print("Available EGM Reviewer Personas:")
+        for alias, filename in sorted(PERSONA_MAP.items()):
+            print(f"  - {alias:25} -> {filename}")
+        return
+
+    agents_dirs, standards_dirs = find_search_directories()
+
+    persona_file = PERSONA_MAP.get(args.persona.lower(), args.persona)
+    if not persona_file.endswith(".md"):
+        persona_file += ".md"
+
+    persona_path = resolve_file(persona_file, agents_dirs)
+    if not persona_path and os.path.exists(args.persona):
+        persona_path = args.persona
+
+    if not persona_path:
+        sys.stderr.write(f"Error: Could not locate persona '{args.persona}'. Searched in:\n")
+        for ad in agents_dirs:
+            sys.stderr.write(f"  - {ad}\n")
+        sys.exit(1)
+
+    system_prompt = load_file_content(persona_path)
+    if not system_prompt:
+        sys.stderr.write(f"Error: Could not load persona from {persona_path}\n")
+        sys.exit(1)
+
+    # Determine Standard
+    standard_name = args.standard
+    if not standard_name:
+        standard_name = DEFAULT_STANDARDS.get(os.path.basename(persona_path), "")
+
+    standard_content = ""
+    if standard_name:
+        if not standard_name.endswith(".md"):
+            standard_name += ".md"
+        std_path = resolve_file(standard_name, standards_dirs)
+        if std_path:
+            standard_content = load_file_content(std_path) or ""
+
+    # Read target content
+    target_content = ""
+    if args.target == "-" or (not args.target and not sys.stdin.isatty()):
+        target_content = sys.stdin.read().strip()
+        target_name = "Piped Input / Git Diff"
+    elif args.target and os.path.exists(args.target):
+        target_content = load_file_content(args.target) or ""
+        target_name = args.target
+    else:
+        sys.stderr.write("Error: Please specify a target file or pipe content via stdin.\n")
+        sys.exit(1)
+
+    if not target_content:
+        sys.stderr.write("Error: Target content is empty.\n")
+        sys.exit(1)
+
+    # Context files
+    context_blocks = []
+    for cf in args.context:
+        c_body = load_file_content(cf)
+        if c_body:
+            context_blocks.append(f"### Context File: {cf}\n```\n{c_body}\n```")
+
+    user_payload_parts = [
+        f"Mode: {args.mode}",
+        f"### Target Scope ({target_name}):\n```\n{target_content}\n```",
+    ]
+
+    if standard_content:
+        user_payload_parts.append(f"### Applicable Target Standard ({os.path.basename(standard_name)}):\n```markdown\n{standard_content}\n```")
+
+    if context_blocks:
+        user_payload_parts.append("### Baseline Supporting Context:\n" + "\n\n".join(context_blocks))
+
+    user_payload_parts.append(
+        "Execute your cold audit now with zero historical assumptions. "
+        "Report all findings with Severity [Blocker | Major | Nit], Affected Scope, and Finding & Guidance."
+    )
+
+    full_user_prompt = "\n\n".join(user_payload_parts)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": full_user_prompt},
+    ]
+
+    payload = {
+        "model": args.model,
+        "reasoning_effort": args.thinking,
+        "messages": messages,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Antigravity": "true",
+        "User-Agent": "Antigravity-EGM-Goldfish/1.0",
+    }
+
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(API_URL, data=req_data, headers=headers, method="POST")
+
+    print(f"\n[EGM Goldfish] Auditing '{target_name}' with persona: {os.path.basename(persona_path)} (Model: {args.model}, Thinking: {args.thinking})...\n" + "=" * 80 + "\n")
+
+    try:
+        with urllib.request.urlopen(req, timeout=360) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            print(content)
+            print("\n" + "=" * 80 + "\n[EGM Goldfish] Audit Complete.\n")
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        sys.stderr.write(f"API Error ({e.code}): {error_body}\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"Connection Error: {e.reason}\nIs gemini-web-to-api running on {API_URL}?\n")
+        sys.exit(1)
+    except Exception as e:
+        sys.stderr.write(f"Unexpected error: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

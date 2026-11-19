@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+consult-neon: Antigravity <-> Gemini 4 Neon Orchestrator Bridge.
+
+Enables Antigravity or any CLI / script to consult Gemini 4 Neon (via local gemini-web-to-api)
+as the High-Reasoning Lead Architect & Planner.
+
+Usage:
+    consult-neon "Design an authentication system with JWT"
+    consult-neon --role debugger --context error.log "Why is this failing?"
+    cat diff.patch | consult-neon --role reviewer "Review this diff"
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+API_URL = os.environ.get("GEMINI_WEB_API_URL", "http://127.0.0.1:4981/openai/v1/chat/completions")
+
+ROLE_PROMPTS = {
+    "planner": (
+        "You are Gemini 4 Neon, the Lead Software Architect and High-Reasoning Planner "
+        "in an agentic coding orchestrator. The executor agent (Antigravity) will execute "
+        "your blueprint.\n\n"
+        "Your role:\n"
+        "1. Deconstruct the task into logical components and edge cases.\n"
+        "2. Detail data structures, APIs, and key algorithms.\n"
+        "3. Provide an atomic, numbered, step-by-step implementation checklist that the executor can follow linearly.\n"
+        "4. Highlight verification criteria and automated test cases."
+    ),
+    "debugger": (
+        "You are Gemini 4 Neon, the Principal Debugger in an agentic coding orchestrator. "
+        "The executor agent hit an obstacle, test failure, or unexpected behavior.\n\n"
+        "Your role:\n"
+        "1. Diagnose the exact root cause of the error or discrepancy.\n"
+        "2. Explain why the failure occurred.\n"
+        "3. Provide the precise corrective code changes and regression test advice."
+    ),
+    "reviewer": (
+        "You are Gemini 4 Neon, the Senior Code Reviewer. Review the provided implementation/diff.\n\n"
+        "Your role:\n"
+        "1. Check for subtle concurrency, boundary, security, or performance bugs.\n"
+        "2. Verify code clarity, idiomatic style, and error handling.\n"
+        "3. Issue an explicit PASS or actionable CHANGE REQUESTS."
+    ),
+    "general": (
+        "You are Gemini 4 Neon, a frontier-tier reasoning AI assistant. "
+        "Think deeply, analyze the user's prompt thoroughly, and provide a clear, comprehensive response."
+    ),
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Consult Gemini 4 Neon from Antigravity")
+    parser.add_argument("prompt", nargs="?", default="", help="Prompt / task description")
+    parser.add_argument("-p", "--prompt-flag", dest="prompt_opt", help="Prompt (alternative to positional)")
+    parser.add_argument("-r", "--role", choices=["planner", "debugger", "reviewer", "general"], default="planner",
+                        help="Role profile for Neon (default: planner)")
+    parser.add_argument("-m", "--model", default="gemini-4-neon", help="Model name (default: gemini-4-neon)")
+    parser.add_argument("-c", "--context", action="append", default=[], help="File path(s) to attach as context")
+    parser.add_argument("--thinking", default="high", choices=["low", "medium", "high"], help="Thinking level (default: high)")
+    parser.add_argument("--json", action="store_true", help="Format request with json_object response format")
+    parser.add_argument("--raw", action="store_true", help="Output raw JSON response from API")
+
+    args = parser.parse_args()
+
+    prompt_text = args.prompt or args.prompt_opt or ""
+
+    # Check if stdin has data piped in
+    stdin_content = ""
+    if not sys.stdin.isatty():
+        try:
+            stdin_content = sys.stdin.read().strip()
+        except Exception:
+            pass
+
+    # Read context files
+    context_blocks = []
+    for filepath in args.context:
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                    context_blocks.append(f"### Context File: {filepath}\n```\n{content}\n```")
+            except Exception as e:
+                sys.stderr.write(f"Warning: Could not read context file {filepath}: {e}\n")
+        else:
+            sys.stderr.write(f"Warning: Context file {filepath} not found.\n")
+
+    if stdin_content:
+        context_blocks.append(f"### Piped Input / Code Context:\n```\n{stdin_content}\n```")
+
+    full_user_content = prompt_text
+    if context_blocks:
+        full_user_content = "\n\n".join(context_blocks) + "\n\n### Task / Instruction:\n" + (prompt_text or "Analyze the provided context.")
+
+    if not full_user_content.strip():
+        sys.stderr.write("Error: No prompt or input provided.\n")
+        sys.exit(1)
+
+    system_prompt = ROLE_PROMPTS.get(args.role, ROLE_PROMPTS["planner"])
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": full_user_content},
+    ]
+
+    payload = {
+        "model": args.model,
+        "reasoning_effort": args.thinking,
+        "messages": messages,
+    }
+
+    if args.json:
+        payload["response_format"] = {"type": "json_object"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Antigravity": "true",
+        "User-Agent": "Antigravity-Orchestrator/1.0",
+    }
+
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(API_URL, data=req_data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            resp_body = response.read().decode("utf-8")
+            data = json.loads(resp_body)
+
+            if args.raw:
+                print(json.dumps(data, indent=2))
+                return
+
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            content = message.get("content", "")
+            print(content)
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        sys.stderr.write(f"API Error ({e.code}): {error_body}\n")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"Connection Error: {e.reason}\nIs gemini-web-to-api running on {API_URL}?\n")
+        sys.exit(1)
+    except Exception as e:
+        sys.stderr.write(f"Unexpected error: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,168 @@
+diff --git a/internal/modules/openai/openai_controller.go b/internal/modules/openai/openai_controller.go
+index a0dbc92..d99f0b4 100644
+--- a/internal/modules/openai/openai_controller.go
++++ b/internal/modules/openai/openai_controller.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"strings"
+ 	"time"
+ 
+ 	models "gemini-web-to-api/internal/commons/models"
+@@ -121,6 +122,24 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
+ 		return c.Status(fiber.StatusBadRequest).JSON(utils.ErrorToResponse(err, "invalid_request_error"))
+ 	}
+ 
++	var extraOpts []providers.GenerateOption
++	ua := strings.ToLower(c.Get("User-Agent"))
++	xAg := strings.ToLower(c.Get("X-Antigravity"))
++	xTemp := strings.ToLower(c.Get("X-Temporary"))
++	isAntigravity := xAg == "true" || strings.Contains(ua, "antigravity") || strings.Contains(ua, "agy")
++
++	if xTemp == "true" {
++		extraOpts = append(extraOpts, providers.WithTemporary(true))
++	} else if xTemp == "false" || isAntigravity {
++		extraOpts = append(extraOpts, providers.WithTemporary(false))
++	}
++	if isAntigravity {
++		lowerModel := strings.ToLower(req.Model)
++		if strings.Contains(lowerModel, "neon") || strings.Contains(lowerModel, "deeper") || strings.Contains(lowerModel, "carbon") || strings.Contains(lowerModel, "complex") {
++			extraOpts = append(extraOpts, providers.WithThinkingLevel("high"))
++		}
++	}
++
+ 	if req.Stream {
+ 		c.Set("Content-Type", "text/event-stream")
+ 		c.Set("Cache-Control", "no-cache")
+@@ -133,7 +152,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
+ 
+ 			err := h.service.CreateChatCompletionStream(ctx, req, func(chunk dto.ChatCompletionChunk) bool {
+ 				return utils.SendSSEEvent(w, h.log, chunk)
+-			})
++			}, extraOpts...)
+ 			if err != nil {
+ 				h.logRequestError("CreateChatCompletionStream failed", err, req.Model)
+ 				errChunk := dto.ChatCompletionChunk{
+@@ -162,7 +181,7 @@ func (h *OpenAIController) HandleChatCompletions(c fiber.Ctx) error {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+ 	defer cancel()
+ 
+-	response, err := h.service.CreateChatCompletion(ctx, req)
++	response, err := h.service.CreateChatCompletion(ctx, req, extraOpts...)
+ 	if err != nil {
+ 		h.logRequestError("CreateChatCompletion failed", err, req.Model)
+ 		return openAIRequestError(c, err)
+diff --git a/internal/modules/openai/openai_service.go b/internal/modules/openai/openai_service.go
+index 3ec9b26..303d8b8 100644
+--- a/internal/modules/openai/openai_service.go
++++ b/internal/modules/openai/openai_service.go
+@@ -101,7 +101,7 @@ func withImageMarkdown(content string, images []providers.Image) string {
+ 	return content + "\n\n" + strings.Join(markdowns, "\n")
+ }
+ 
+-func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCompletionRequest) (*dto.ChatCompletionResponse, error) {
++func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCompletionRequest, options ...providers.GenerateOption) (*dto.ChatCompletionResponse, error) {
+ 	modelMessages := req.ToModelMessages()
+ 
+ 	if err := s.ValidateChatCompletion(req); err != nil {
+@@ -130,6 +130,7 @@ func (s *OpenAIService) CreateChatCompletion(ctx context.Context, req dto.ChatCo
+ 	if req.Model != "" {
+ 		opts = append(opts, providers.WithModel(req.Model))
+ 	}
++	opts = append(opts, options...)
+ 	inputFiles, err := providers.InputFilesFromAttachments(modelMessages)
+ 	if err != nil {
+ 		return nil, err
+@@ -425,8 +426,8 @@ func (s *OpenAIService) CreateSpeech(ctx context.Context, req dto.SpeechRequest)
+ }
+ 
+ // CreateChatCompletionStream handles OpenAI streaming logic within the service layer.
+-func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.ChatCompletionRequest, onEvent func(dto.ChatCompletionChunk) bool) error {
+-	response, err := s.CreateChatCompletion(ctx, req)
++func (s *OpenAIService) CreateChatCompletionStream(ctx context.Context, req dto.ChatCompletionRequest, onEvent func(dto.ChatCompletionChunk) bool, options ...providers.GenerateOption) error {
++	response, err := s.CreateChatCompletion(ctx, req, options...)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/modules/providers/gemini_models.go b/internal/modules/providers/gemini_models.go
+index 8fa4469..845feee 100644
+--- a/internal/modules/providers/gemini_models.go
++++ b/internal/modules/providers/gemini_models.go
+@@ -319,6 +319,20 @@ func geminiModelNames(modelID, category, display string) (string, []string) {
+ 		add(slug(value))
+ 		add(prefix(strings.TrimPrefix(slug(value), "gemini-")))
+ 	}
++	lowerDisplay := strings.ToLower(display)
++	if strings.Contains(lowerDisplay, "deeper analysis") {
++		add("neon")
++		add("gemini-neon")
++		add("gemini-4-neon")
++	} else if strings.Contains(lowerDisplay, "everyday help") {
++		add("hydrogen")
++		add("gemini-hydrogen")
++		add("gemini-4-hydrogen")
++	} else if strings.Contains(lowerDisplay, "code") && strings.Contains(lowerDisplay, "complex") {
++		add("carbon")
++		add("gemini-carbon")
++		add("gemini-4-carbon")
++	}
+ 	if category != "" {
+ 		if version := geminiVersionPattern.FindStringSubmatch(display); len(version) > 1 {
+ 			add("gemini-" + version[0] + "-" + slug(category))
+diff --git a/internal/modules/providers/gemini_service.go b/internal/modules/providers/gemini_service.go
+index d3e7b01..c2edf9f 100644
+--- a/internal/modules/providers/gemini_service.go
++++ b/internal/modules/providers/gemini_service.go
+@@ -631,6 +631,12 @@ func (c *Client) generateContent(ctx context.Context, prompt string, metadata []
+ 		c.generationID = strings.ToUpper(uuid.NewString())
+ 	}
+ 	selectedModel, modelErr := resolveGeminiModel(config.Model, c.cachedModels)
++	if config.ThinkingLevel == "" && modelErr == nil {
++		lowerName := strings.ToLower(selectedModel.DisplayName + " " + selectedModel.ID)
++		if strings.Contains(lowerName, "deeper") || strings.Contains(lowerName, "complex") {
++			thinkingLevel = 2 // high reasoning by default for Neon and Carbon
++		}
++	}
+ 	at := c.at
+ 	cookieHdr := c.cookieHeader
+ 	buildLabel := c.buildLabel
+@@ -659,7 +665,11 @@ func (c *Client) generateContent(ctx context.Context, prompt string, metadata []
+ 	}
+ 
+ 	requestID := strings.ToUpper(uuid.NewString())
+-	inner := buildGenerateInner(prompt, uploadedFiles, selectedModel.ModelNumber, language, requestID, c.defaultTemporary)
++	isTemporary := c.defaultTemporary
++	if config.Temporary != nil {
++		isTemporary = *config.Temporary
++	}
++	inner := buildGenerateInner(prompt, uploadedFiles, selectedModel.ModelNumber, language, requestID, isTemporary)
+ 	inner[80] = thinkingLevel
+ 	if metadata != nil {
+ 		inner[2] = metadata
+diff --git a/internal/modules/providers/provider_interface.go b/internal/modules/providers/provider_interface.go
+index ab6b233..6c453f2 100644
+--- a/internal/modules/providers/provider_interface.go
++++ b/internal/modules/providers/provider_interface.go
+@@ -117,6 +117,7 @@ type GenerateConfig struct {
+ 	Video                   *VideoConfig
+ 	Canvas                  bool
+ 	Music                   *MusicConfig
++	Temporary               *bool
+ }
+ 
+ // InputFile is an in-memory file to upload with a generation request.
+@@ -163,6 +164,13 @@ func WithInputFiles(files []InputFile) GenerateOption {
+ 	}
+ }
+ 
++// WithTemporary overrides whether the generation runs in temporary incognito mode.
++func WithTemporary(temporary bool) GenerateOption {
++	return func(c *GenerateConfig) {
++		c.Temporary = &temporary
++	}
++}
++
+ // WithGeneratedImageDownload requests that the provider authenticate and
+ // download the bytes of any generated image, populating Image.B64JSON.
+ // Callers that only need the image URL (e.g. chat completions) should leave
